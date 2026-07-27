@@ -1,0 +1,61 @@
+# GoReleaser config for repo-sync.
+# https://goreleaser.com
+#
+# CGO is disabled so the binary is fully static (no glibc dependency) and runs
+# unmodified across modern Linux distributions.
+version: 2
+
+project_name: repo-sync
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: repo-sync
+    main: .
+    binary: repo-sync
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/grmrgecko/repo-sync/config.Version={{ .Version }}
+      - -X github.com/grmrgecko/repo-sync/config.Commit={{ .ShortCommit }}
+      - -X github.com/grmrgecko/repo-sync/config.Date={{ .Date }}
+      - -X github.com/grmrgecko/repo-sync/config.Mode=release
+    goos:
+      - linux
+    goarch:
+      - "386"
+      - amd64
+      - arm
+      - arm64
+      - ppc64le
+    goarm:
+      - "6"
+
+archives:
+  - id: default
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  use: git
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

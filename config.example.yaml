@@ -1,0 +1,154 @@
+# Example repo-sync mirror server configuration.
+#
+# The server proxies and caches upstream package mirrors. Repositories are
+# discovered from client requests: fetching a repository's entry-point
+# metadata (repodata/repomd.xml, dists/<suite>/InRelease, <name>.db,
+# APKINDEX.tar.gz) registers it for full synchronization and periodic
+# refreshing. Repositories listed under a mount's `repos` are kept
+# synchronized regardless of traffic.
+
+# state_path persists discovered repositories across restarts. When unset
+# it defaults to state.yaml next to the config file (./config.yaml keeps
+# state in ./state.yaml), or /etc/repo-sync/state.yaml without one.
+state_path: /etc/repo-sync/state.yaml
+state_flush_interval: 30s
+
+# repo_crawl_interval is how often known repositories are refreshed while
+# they keep being requested. failure_retry_interval schedules the next
+# attempt after a failed crawl. crawl_check_interval is the scheduler tick.
+repo_crawl_interval: 4h
+failure_retry_interval: 1h
+crawl_check_interval: 30m
+
+# generic_max_age bounds how stale a plain cached file (anything outside a
+# repository) may be before it is revalidated upstream. Upstream 404s are
+# remembered for negative_cache_ttl and transient errors for
+# transient_error_ttl so failures are not amplified per client.
+generic_max_age: 6h
+negative_cache_ttl: 1h
+transient_error_ttl: 1m
+
+http:
+  bind_addr: ""
+  port: 8080
+  read_header_timeout: 10s
+  read_timeout: 5m
+  write_timeout: 30m
+  idle_timeout: 2m
+  # directory_indexes enables directory listings: upstream index pages are
+  # passed through, and when no catch-all "/" mount exists the root serves
+  # a generated index of the mounts and their configured repositories.
+  # When false, directory requests answer with a static notice page.
+  directory_indexes: true
+
+log:
+  # Severity threshold: debug, info, warn, error.
+  level: info
+  # Formatter: console (text) or json.
+  type: console
+  # Outputs may include "console" (stderr) or explicit file paths.
+  outputs:
+    - console
+
+# domains map the request Host header to a filesystem tree. Exactly one
+# domain has the online role: its tree is the writable cache that misses
+# are fetched into and crawls write to. Offline domains are read-only
+# published trees that fall back to the online tree for anything missing,
+# and are promoted out-of-band (e.g. by snapshot tooling).
+domains:
+  - domain: mirror.example.com
+    role: online
+    root: /var/lib/repo-sync/online
+  - domain: stage.mirror.example.com
+    role: offline
+    root: /var/lib/repo-sync/stage
+
+# mounts map base request paths onto upstream mirrors; the longest matching
+# path wins, and "/" is allowed as a catch-all. A request for
+# /almalinux/9/BaseOS/x86_64/os/repodata/repomd.xml resolves through the
+# /almalinux mount and registers that path as an RPM repository. Each mount
+# may also pin repositories that stay synchronized without client traffic.
+mounts:
+  - path: /almalinux
+    upstream: https://mirror.example.com/almalinux
+    repos:
+      - path: /almalinux/9/BaseOS/x86_64/os
+        type: rpm
+  - path: /centos
+    upstream: https://vault.centos.org
+  - path: /ubuntu
+    upstream: https://mirror.example.com/ubuntu
+  - path: /archlinux
+    upstream: https://mirror.example.com/archlinux
+  - path: /alpine
+    upstream: https://dl-cdn.alpinelinux.org/alpine
+
+# The crawler section also applies to the sync commands: they use these
+# workers, prune_grace, request_timeout, and user_agent unless the
+# equivalent flag overrides them.
+crawler:
+  # workers is the number of download workers inside a single crawl;
+  # concurrent_crawls bounds how many repository crawls run at once.
+  workers: 4
+  concurrent_crawls: 4
+  # request_timeout bounds how long an upstream may take to start
+  # responding to a request (response header timeout).
+  request_timeout: 2m
+  # user_agent overrides the default repo-sync/<version>.
+  user_agent: ""
+  # prune_grace keeps files that left a repository for this long before
+  # crawl-time pruning removes them.
+  prune_grace: 24h
+  # missing_mode decides what happens when an upstream does not serve a
+  # package its repository metadata lists, which published repositories are
+  # not rare in doing:
+  #   retry  - mirror the rest of the repository and keep reporting the
+  #            absence as a failure until the same file has been missing for
+  #            missing_retries consecutive runs, after which it is recorded
+  #            in the repository as a known absence and stops failing runs
+  #   fail   - stop the repository at the first missing file
+  #   ignore - skip missing files without ever failing
+  # A repository's own metadata is always required regardless of the mode.
+  missing_mode: retry
+  missing_retries: 3
+  # discover_cache is how long "sync --discover" reuses a crawl's results
+  # before scanning the tree again. The results are kept at the destination
+  # root in .repo-sync-state.json, which is also what tells a later run
+  # which repositories the upstream has dropped since. Zero scans on every
+  # run.
+  discover_cache: 72h
+  # Backoff steps applied once a repository stops being requested. The
+  # first tier is repo_crawl_interval; each entry extends the refresh
+  # interval as the resource ages, and once the total budget elapses the
+  # resource is evicted from the online cache.
+  refresh_schedule:
+    - 12h
+    - 24h
+    - 48h
+    - 72h
+    - 96h
+    - 120h
+
+# The trace section publishes a file describing this mirror into every
+# repository the sync commands synchronize and the server crawls, following
+# the convention Debian archives established at project/trace/<host>.
+# Downstream mirrors and mirror checkers read it to learn who runs a mirror,
+# where it is, and when it last synchronized. The traces upstream publishes
+# are mirrored beside it, so the directory names every mirror the content
+# passed through. It is disabled by default, and every field can be
+# overridden with the matching --trace-* flag.
+trace:
+  # Traces are written only when this is enabled, or --trace is passed.
+  enabled: false
+  # The name this mirror is traced under, which is also the trace file's
+  # name. Defaults to the system hostname.
+  host: ""
+  # Contact for whoever runs this mirror, in "name <email>" form.
+  maintainer: ""
+  # Who provides the hardware or bandwidth, if anyone.
+  sponsor: ""
+  # Where the mirror is, for clients choosing a nearby one.
+  country: ""
+  location: ""
+  # How much bandwidth the mirror has available.
+  throughput: ""

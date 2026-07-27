@@ -1,0 +1,7 @@
+/repo-sync
+/dist/
+
+*.exe
+*.test
+*.out
+*.prof
