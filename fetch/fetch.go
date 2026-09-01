@@ -71,6 +71,10 @@ func Reload() {
 // treat missing optional files differently from transport failures.
 var ErrNotFound = errors.New("upstream file not found")
 
+// ErrForbidden marks an upstream file that returned HTTP 403. Callers may
+// tolerate this for optional files on object stores that hide missing keys.
+var ErrForbidden = errors.New("upstream file forbidden")
+
 // ErrNotModified marks a conditional request the upstream answered with
 // 304, meaning the local copy is already current.
 var ErrNotModified = errors.New("upstream file not modified")
@@ -229,6 +233,17 @@ func lockFile(dst string) func() {
 // With stage set the download is written next to dst for a later promote so
 // readers of a live tree never see a partially updated repository.
 func File(ctx context.Context, src *Source, reqPath, dst string, want *Expect, stage, verifyExisting bool) (FileState, error) {
+	return file(ctx, src, reqPath, dst, want, stage, verifyExisting, false)
+}
+
+// FileFresh downloads reqPath without conditionally reusing the current
+// destination. It is used when related upstream files must be refetched as
+// one generation after a consistency check fails.
+func FileFresh(ctx context.Context, src *Source, reqPath, dst string, want *Expect, stage bool) (FileState, error) {
+	return file(ctx, src, reqPath, dst, want, stage, false, true)
+}
+
+func file(ctx context.Context, src *Source, reqPath, dst string, want *Expect, stage, verifyExisting, force bool) (FileState, error) {
 	// Serialize writers to this destination so concurrent callers, such
 	// as the mirror server's on-demand fetches and background crawls,
 	// cannot interleave partial downloads of the same file.
@@ -259,7 +274,7 @@ func File(ctx context.Context, src *Source, reqPath, dst string, want *Expect, s
 	}
 
 	for {
-		state, err := download(ctx, src, reqPath, dst, want, stage, resumeFrom)
+		state, err := download(ctx, src, reqPath, dst, want, stage, resumeFrom, force)
 		if err != nil && resumeFrom > 0 && !errors.Is(err, ErrNotFound) && ctx.Err() == nil {
 			// The partial may not be a prefix of the current upstream file;
 			// retry once from scratch.
@@ -274,12 +289,12 @@ func File(ctx context.Context, src *Source, reqPath, dst string, want *Expect, s
 
 // download performs one transfer attempt for File, appending to the
 // partial file when resuming from a prior failure.
-func download(ctx context.Context, src *Source, reqPath, dst string, want *Expect, stage bool, resumeFrom int64) (FileState, error) {
+func download(ctx context.Context, src *Source, reqPath, dst string, want *Expect, stage bool, resumeFrom int64, force bool) (FileState, error) {
 	// Files without published checksums cannot be verified locally, so an
 	// existing copy is revalidated with a conditional request instead of
 	// being re-downloaded every run.
 	var modifiedSince time.Time
-	if want == nil {
+	if want == nil && !force {
 		if info, err := os.Stat(dst); err == nil && info.Mode().IsRegular() {
 			modifiedSince = info.ModTime()
 		}

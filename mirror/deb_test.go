@@ -6,9 +6,12 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/grmrgecko/repo-sync/fetch"
 	"github.com/grmrgecko/repo-sync/internal/testrepos"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestParseRelease verifies field extraction and checksum block merging.
@@ -36,6 +39,40 @@ func TestParseRelease(t *testing.T) {
 	if rel.files["main/binary-amd64/Packages.gz"] == nil {
 		t.Error("gz variant missing")
 	}
+}
+
+// TestSyncDebSignedRelease verifies apt cleartext and detached signatures
+// before replacing the live release generation.
+func TestSyncDebSignedRelease(t *testing.T) {
+	www := t.TempDir()
+	repoDir := filepath.Join(www, "debian")
+	testrepos.BuildDebRepo(t, repoDir)
+	key := testrepos.NewSigningKey(t)
+	key.SignDebRepo(t, repoDir)
+	srv := testrepos.ServeDir(t, www)
+
+	dest := t.TempDir()
+	opts := &Options{
+		Type:          RepoDeb,
+		Destination:   dest,
+		Workers:       2,
+		SignatureMode: SignatureRequired,
+		GPGKeyData:    [][]byte{key.PublicKey(t)},
+	}
+	repoURL := srv.URL + "/debian/dists/test"
+	require.NoError(t, syncOne(context.Background(), repoURL, opts.Type, opts))
+
+	local := filepath.Join(dest, "debian", "dists", "test", "InRelease")
+	published := requireReadFile(t, local)
+	upstream := filepath.Join(repoDir, "dists", "test", "InRelease")
+	tampered := bytes.Replace(requireReadFile(t, upstream), []byte("Origin: Test"), []byte("Origin: Pest"), 1)
+	require.NoError(t, os.WriteFile(upstream, tampered, 0644))
+	future := time.Now().Add(2 * time.Second)
+	require.NoError(t, os.Chtimes(upstream, future, future))
+
+	require.Error(t, syncOne(context.Background(), repoURL, opts.Type, opts))
+	assert.Equal(t, published, requireReadFile(t, local), "a bad InRelease must not replace the verified release")
+	assert.NoFileExists(t, local+fetch.StagedSuffix)
 }
 
 // TestIndexArch verifies architecture extraction from release file paths.

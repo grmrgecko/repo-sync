@@ -92,6 +92,13 @@ type CrawlerConfig struct {
 	// DiscoverCache is how long a discovery crawl's results are reused
 	// before the tree is scanned again.
 	DiscoverCache time.Duration `mapstructure:"discover_cache" yaml:"discover_cache" validate:"gte=0"`
+	// SignatureMode controls OpenPGP verification of repository metadata.
+	SignatureMode string `mapstructure:"signature_mode" yaml:"signature_mode" validate:"oneof=off if-present required"`
+	// GPGKeys lists local public keyring files used for signature checks.
+	GPGKeys []string `mapstructure:"gpg_keys" yaml:"gpg_keys"`
+	// Keyservers lists optional OpenPGP keyservers used to retrieve unknown
+	// signature issuers.
+	Keyservers []string `mapstructure:"keyservers" yaml:"keyservers" validate:"omitempty,dive,url"`
 }
 
 // TraceConfig describes the mirror this instance publishes, and is written
@@ -203,6 +210,15 @@ func loadConfig(configPath string) (*Config, error) {
 			c.StatePath = "/etc/repo-sync/state.yaml"
 		}
 	}
+	if file != "" {
+		for i, name := range c.Crawler.GPGKeys {
+			name = strings.TrimSpace(name)
+			if name != "" && name != "~" && !strings.HasPrefix(name, "~/") && !filepath.IsAbs(name) {
+				name = filepath.Join(filepath.Dir(file), name)
+			}
+			c.Crawler.GPGKeys[i] = name
+		}
+	}
 
 	if err := c.finalize(); err != nil {
 		return nil, err
@@ -292,6 +308,11 @@ func setDefaults(v *viper.Viper) {
 	v.SetDefault("crawler.missing_mode", "retry")
 	v.SetDefault("crawler.missing_retries", 3)
 	v.SetDefault("crawler.discover_cache", 72*time.Hour)
+	v.SetDefault("crawler.signature_mode", "off")
+	v.SetDefault("crawler.keyservers", []string{
+		"https://keyserver.ubuntu.com",
+		"https://keys.openpgp.org",
+	})
 	v.SetDefault("crawler.refresh_schedule", []time.Duration{
 		12 * time.Hour, 24 * time.Hour, 48 * time.Hour,
 		72 * time.Hour, 96 * time.Hour, 120 * time.Hour,
@@ -306,6 +327,12 @@ func (c *Config) finalize() error {
 	if err := validateConfig(c); err != nil {
 		return err
 	}
+	for _, raw := range c.Crawler.Keyservers {
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("invalid crawler keyserver URL %q", raw)
+		}
+	}
 	if err := c.indexDomains(); err != nil {
 		return err
 	}
@@ -315,6 +342,13 @@ func (c *Config) finalize() error {
 // canonicalize normalizes user-supplied values before validation.
 func (c *Config) canonicalize() {
 	c.StatePath = expandHome(strings.TrimSpace(c.StatePath))
+	c.Crawler.SignatureMode = strings.ToLower(strings.TrimSpace(c.Crawler.SignatureMode))
+	for i := range c.Crawler.GPGKeys {
+		c.Crawler.GPGKeys[i] = expandHome(strings.TrimSpace(c.Crawler.GPGKeys[i]))
+	}
+	for i := range c.Crawler.Keyservers {
+		c.Crawler.Keyservers[i] = strings.TrimRight(strings.TrimSpace(c.Crawler.Keyservers[i]), "/")
+	}
 	for i := range c.Domains {
 		c.Domains[i].Domain = strings.ToLower(strings.TrimSpace(c.Domains[i].Domain))
 		c.Domains[i].Role = strings.ToLower(strings.TrimSpace(c.Domains[i].Role))

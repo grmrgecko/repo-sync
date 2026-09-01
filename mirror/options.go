@@ -83,6 +83,16 @@ type Options struct {
 	Workers int
 	// Verify re-verifies checksums of existing local files.
 	Verify bool
+	// SignatureMode controls OpenPGP verification of repository metadata.
+	SignatureMode SignatureMode
+	// GPGKeys lists local public keyring files used for signature checks.
+	GPGKeys []string
+	// GPGKeyData carries public keyrings preloaded from one configuration
+	// snapshot. The mirror server uses it to keep reloads out of a crawl.
+	GPGKeyData [][]byte
+	// Keyservers lists optional OpenPGP keyservers used to retrieve an unknown
+	// signature issuer. Retrieved keys prove pairing but are not trust anchors.
+	Keyservers []string
 	// Prune deletes local files no longer part of the repository.
 	Prune bool
 	// PruneGrace defers pruning a file until it has been unreferenced for

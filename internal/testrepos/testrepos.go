@@ -16,7 +16,116 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/ProtonMail/go-crypto/openpgp/clearsign"
 )
+
+// SigningKey is a generated OpenPGP key used by signed repository fixtures.
+type SigningKey struct {
+	entity *openpgp.Entity
+}
+
+// NewSigningKey generates an OpenPGP signing key for a test repository.
+func NewSigningKey(t *testing.T) *SigningKey {
+	t.Helper()
+	entity, err := openpgp.NewEntity("Repository test key", "", "repo@example.com", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &SigningKey{entity: entity}
+}
+
+// PublicKey returns the armored public keyring for the signing key.
+func (k *SigningKey) PublicKey(t *testing.T) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	w, err := armor.Encode(&out, openpgp.PublicKeyType, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := k.entity.Serialize(w); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+// Sign returns an armored detached signature over data.
+func (k *SigningKey) Sign(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	if err := openpgp.ArmoredDetachSign(&out, k.entity, bytes.NewReader(data), nil); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+// SignBinary returns a binary detached signature over data.
+func (k *SigningKey) SignBinary(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	if err := openpgp.DetachSign(&out, k.entity, bytes.NewReader(data), nil); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+// ClearSign returns an armored cleartext signature over data.
+func (k *SigningKey) ClearSign(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var out bytes.Buffer
+	w, err := clearsign.Encode(&out, k.entity.PrivateKey, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return out.Bytes()
+}
+
+// SignRPMRepo replaces the fixture signature and publishes its public key.
+func (k *SigningKey) SignRPMRepo(t *testing.T, dir string) {
+	t.Helper()
+	repomd, err := os.ReadFile(filepath.Join(dir, "repodata", "repomd.xml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	WriteFile(t, filepath.Join(dir, "repodata", "repomd.xml.asc"), k.Sign(t, repomd))
+	WriteFile(t, filepath.Join(dir, "repodata", "repomd.xml.key"), k.PublicKey(t))
+}
+
+// SignDebRepo signs the fixture Release file in both apt formats.
+func (k *SigningKey) SignDebRepo(t *testing.T, dir string) {
+	t.Helper()
+	release, err := os.ReadFile(filepath.Join(dir, "dists", "test", "Release"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	WriteFile(t, filepath.Join(dir, "dists", "test", "InRelease"), k.ClearSign(t, release))
+	WriteFile(t, filepath.Join(dir, "dists", "test", "Release.gpg"), k.SignBinary(t, release))
+}
+
+// SignArchRepo signs the fixture database and each package with binary
+// detached signatures, matching files published by Arch mirrors.
+func (k *SigningKey) SignArchRepo(t *testing.T, dir, name string, packages map[string][]byte) {
+	t.Helper()
+	database, err := os.ReadFile(filepath.Join(dir, name+".db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	WriteFile(t, filepath.Join(dir, name+".db.sig"), k.SignBinary(t, database))
+	for filename, data := range packages {
+		WriteFile(t, filepath.Join(dir, filename+".sig"), k.SignBinary(t, data))
+	}
+}
 
 // WriteFile creates a file with parent directories under a fixture tree.
 func WriteFile(t *testing.T, name string, data []byte) {

@@ -4,6 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // writeConfig writes a temp config file and returns its path.
@@ -139,4 +142,16 @@ func TestInitWithoutServerSections(t *testing.T) {
 	if err := InitServer(path); err == nil {
 		t.Error("InitServer accepted a configuration with no domains")
 	}
+}
+
+// TestKeyserverConfiguration verifies the built-in lookup services can be
+// replaced or disabled without retaining entries from the default list.
+func TestKeyserverConfiguration(t *testing.T) {
+	path := writeConfig(t, "crawler:\n  keyservers:\n    - https://keys.example.com\n")
+	require.NoError(t, Init(path))
+	assert.Equal(t, []string{"https://keys.example.com"}, C.Crawler.Keyservers)
+
+	path = writeConfig(t, "crawler:\n  keyservers: []\n")
+	require.NoError(t, Init(path))
+	assert.Empty(t, C.Crawler.Keyservers)
 }

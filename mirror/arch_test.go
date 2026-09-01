@@ -10,9 +10,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/grmrgecko/repo-sync/fetch"
 	"github.com/grmrgecko/repo-sync/internal/testrepos"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestParseDesc verifies field extraction from a pacman desc entry.
@@ -31,6 +34,43 @@ func TestParseDesc(t *testing.T) {
 	if fields["DESC"] != "First line" {
 		t.Errorf("DESC = %q, want first value only", fields["DESC"])
 	}
+}
+
+// TestSyncArchSignedPackages verifies Arch binary signatures before replacing
+// any package or repository database in the live tree.
+func TestSyncArchSignedPackages(t *testing.T) {
+	www := t.TempDir()
+	repoDir := filepath.Join(www, "core", "os", "x86_64")
+	packages := testrepos.BuildArchRepo(t, repoDir, "core")
+	key := testrepos.NewSigningKey(t)
+	key.SignArchRepo(t, repoDir, "core", packages)
+	srv := testrepos.ServeDir(t, www)
+
+	dest := t.TempDir()
+	opts := &Options{
+		Type:          RepoArch,
+		Destination:   dest,
+		Workers:       2,
+		SignatureMode: SignatureRequired,
+		GPGKeyData:    [][]byte{key.PublicKey(t)},
+	}
+	repoURL := srv.URL + "/core/os/x86_64"
+	require.NoError(t, syncOne(context.Background(), repoURL, opts.Type, opts))
+
+	var packageName string
+	for packageName = range packages {
+		break
+	}
+	localSig := filepath.Join(dest, "core", "os", "x86_64", packageName+".sig")
+	published := requireReadFile(t, localSig)
+	upstreamSig := filepath.Join(repoDir, packageName+".sig")
+	require.NoError(t, os.WriteFile(upstreamSig, []byte("invalid signature"), 0644))
+	future := time.Now().Add(2 * time.Second)
+	require.NoError(t, os.Chtimes(upstreamSig, future, future))
+
+	require.Error(t, syncOne(context.Background(), repoURL, opts.Type, opts))
+	assert.Equal(t, published, requireReadFile(t, localSig), "a bad package signature must not replace the verified pair")
+	assert.NoFileExists(t, localSig+fetch.StagedSuffix)
 }
 
 // TestReadArchDB verifies database parsing for both compressed and plain

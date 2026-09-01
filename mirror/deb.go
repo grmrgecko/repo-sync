@@ -45,6 +45,178 @@ type debRelease struct {
 	files         map[string]*debFile
 }
 
+// debReleaseSet tracks one staged set of apt release documents.
+type debReleaseSet struct {
+	names         []string
+	dsts          map[string]string
+	missing       map[string]bool
+	data          []byte
+	authenticated bool
+}
+
+// cleanup removes unpublished release files left by a failed synchronization.
+func (r *debReleaseSet) cleanup() {
+	for _, dst := range r.dsts {
+		_ = os.Remove(dst + fetch.StagedSuffix)
+	}
+}
+
+// stageDebRelease stages and verifies the apt release documents before any
+// checksums or package paths are trusted.
+func stageDebRelease(ctx context.Context, src *fetch.Source, destSuite, suitePrefix string, opts *Options) (*debReleaseSet, error) {
+	r := &debReleaseSet{
+		names:   []string{"InRelease", "Release", "Release.gpg"},
+		dsts:    map[string]string{},
+		missing: map[string]bool{},
+	}
+	for _, name := range r.names {
+		dst, err := fetch.LocalJoin(destSuite, name)
+		if err != nil {
+			return nil, err
+		}
+		r.dsts[name] = dst
+		if err := r.fetch(ctx, src, suitePrefix, name, false); err != nil {
+			r.cleanup()
+			return nil, err
+		}
+	}
+
+	mode := opts.SignatureMode
+	if mode == "" {
+		mode = SignatureOff
+	}
+	if mode == SignatureOff {
+		return r.selectData(false)
+	}
+	verifier, err := newSignatureVerifier(opts)
+	if err != nil {
+		r.cleanup()
+		return nil, err
+	}
+
+	// InRelease is self-contained, so a mismatch only needs that document
+	// refetched. Detached Release signatures retry both members together.
+	if !r.missing["InRelease"] {
+		for attempt := 0; attempt < 2; attempt++ {
+			data, err := os.ReadFile(fetch.StagedOrFinal(r.dsts["InRelease"]))
+			if err != nil {
+				r.cleanup()
+				return nil, err
+			}
+			plaintext, fingerprint, verifyErr := verifier.verifyClearsigned(ctx, data)
+			if verifyErr == nil {
+				r.data = plaintext
+				r.authenticated = true
+				log.WithField("fingerprint", fingerprint).Debug("Verified InRelease signature.")
+				break
+			}
+			if attempt == 1 {
+				r.cleanup()
+				return nil, fmt.Errorf("verify InRelease signature after refetch: %w", verifyErr)
+			}
+			log.WithError(verifyErr).Warn("Staged InRelease signature failed verification; refetching.")
+			if err := r.fetch(ctx, src, suitePrefix, "InRelease", true); err != nil {
+				r.cleanup()
+				return nil, err
+			}
+			if r.missing["InRelease"] {
+				break
+			}
+		}
+	}
+
+	if !r.missing["Release.gpg"] {
+		if r.missing["Release"] {
+			r.cleanup()
+			return nil, errors.New("repository serves Release.gpg without Release")
+		}
+		for attempt := 0; attempt < 2; attempt++ {
+			fingerprint, verifyErr := verifier.verifyDetached(ctx, fetch.StagedOrFinal(r.dsts["Release"]), fetch.StagedOrFinal(r.dsts["Release.gpg"]), "")
+			if verifyErr == nil {
+				log.WithField("fingerprint", fingerprint).Debug("Verified Release.gpg signature.")
+				if r.missing["InRelease"] {
+					r.authenticated = true
+				}
+				break
+			}
+			if attempt == 1 {
+				r.cleanup()
+				return nil, fmt.Errorf("verify Release.gpg signature after refetch: %w", verifyErr)
+			}
+			log.WithError(verifyErr).Warn("Staged Release signature failed verification; refetching the pair.")
+			for _, name := range []string{"Release", "Release.gpg"} {
+				if err := r.fetch(ctx, src, suitePrefix, name, true); err != nil {
+					r.cleanup()
+					return nil, err
+				}
+			}
+			if r.missing["Release"] {
+				r.cleanup()
+				return nil, errors.New("release disappeared while refetching its signature pair")
+			}
+			if r.missing["Release.gpg"] {
+				break
+			}
+		}
+	}
+
+	if r.missing["InRelease"] {
+		if r.missing["Release"] {
+			r.cleanup()
+			return nil, errors.New("repository serves neither InRelease nor Release")
+		}
+		if r.missing["Release.gpg"] && mode == SignatureRequired {
+			r.cleanup()
+			return nil, errors.New("repository signature is required but Release.gpg is missing")
+		}
+		data, err := os.ReadFile(fetch.StagedOrFinal(r.dsts["Release"]))
+		if err != nil {
+			r.cleanup()
+			return nil, err
+		}
+		r.data = data
+	}
+	return r, nil
+}
+
+func (r *debReleaseSet) fetch(ctx context.Context, src *fetch.Source, suitePrefix, name string, fresh bool) error {
+	var err error
+	if fresh {
+		_, err = fetch.FileFresh(ctx, src, suitePrefix+name, r.dsts[name], nil, true)
+	} else {
+		_, err = fetch.File(ctx, src, suitePrefix+name, r.dsts[name], nil, true, false)
+	}
+	switch {
+	case err == nil:
+		r.missing[name] = false
+		return nil
+	case errors.Is(err, fetch.ErrNotFound), errors.Is(err, fetch.ErrForbidden):
+		r.missing[name] = true
+		return nil
+	default:
+		return fmt.Errorf("fetch %s: %w", name, err)
+	}
+}
+
+func (r *debReleaseSet) selectData(authenticated bool) (*debReleaseSet, error) {
+	name := "InRelease"
+	if r.missing[name] {
+		name = "Release"
+	}
+	if r.missing[name] {
+		r.cleanup()
+		return nil, errors.New("repository serves neither InRelease nor Release")
+	}
+	data, err := os.ReadFile(fetch.StagedOrFinal(r.dsts[name]))
+	if err != nil {
+		r.cleanup()
+		return nil, err
+	}
+	r.data = data
+	r.authenticated = authenticated
+	return r, nil
+}
+
 // releaseSumFields maps Release checksum block names to algorithm names,
 // including the MD5sum casing some repositories use.
 var releaseSumFields = map[string]string{
@@ -139,45 +311,13 @@ func syncDeb(ctx context.Context, src *fetch.Source, repoURL string, opts *Optio
 	// the archive's other suites.
 	miss := opts.newMissing(destSuite)
 
-	// Stage the release files; they are promoted last so a live tree keeps
-	// a consistent metadata chain.
-	releaseNames := []string{"InRelease", "Release", "Release.gpg"}
-	releaseStates := make([]fetch.FileState, len(releaseNames))
-	for i, name := range releaseNames {
-		dst, err := fetch.LocalJoin(destSuite, name)
-		if err != nil {
-			return err
-		}
-		state, err := fetch.File(ctx, src, suitePrefix+name, dst, nil, true, false)
-		if err != nil {
-			if errors.Is(err, fetch.ErrNotFound) {
-				// The upstream dropped this release file; drop the local
-				// copy so outdated metadata is never served.
-				if !opts.DryRun {
-					fetch.RemoveStale(dst)
-				}
-				continue
-			}
-			return fmt.Errorf("fetch %s: %w", name, err)
-		}
-		releaseStates[i] = state
-	}
-
-	// Parse the strongest release document available, which may be the
-	// promoted copy when the upstream reported it unchanged.
-	var relData []byte
-	switch {
-	case releaseStates[0] != fetch.FileMissing:
-		relData, err = os.ReadFile(fetch.StagedOrFinal(filepath.Join(destSuite, "InRelease")))
-	case releaseStates[1] != fetch.FileMissing:
-		relData, err = os.ReadFile(fetch.StagedOrFinal(filepath.Join(destSuite, "Release")))
-	default:
-		return errors.New("repository serves neither InRelease nor Release")
-	}
+	// Authenticate release checksums before selecting any index or pool file.
+	releaseSet, err := stageDebRelease(ctx, src, destSuite, suitePrefix, opts)
 	if err != nil {
 		return err
 	}
-	rel, err := parseRelease(relData)
+	defer releaseSet.cleanup()
+	rel, err := parseRelease(releaseSet.data)
 	if err != nil {
 		return err
 	}
@@ -190,7 +330,7 @@ func syncDeb(ctx context.Context, src *fetch.Source, repoURL string, opts *Optio
 	for _, f := range sortedFiles(rel.files) {
 		// Releases commonly list their own release files; those are
 		// already staged above and must not be fetched twice.
-		if slices.Contains(releaseNames, f.path) {
+		if slices.Contains(releaseSet.names, f.path) {
 			continue
 		}
 		if !includeIndexFile(f.path, opts.Components, opts.Architectures) {
@@ -216,8 +356,9 @@ func syncDeb(ctx context.Context, src *fetch.Source, repoURL string, opts *Optio
 		}
 		indexJobs = append(indexJobs, job)
 	}
-	fetch.PlanJobs(plannedJobs, opts.Verify, keep)
-	states, err := fetch.Many(ctx, src, indexJobs, opts.Workers, opts.Verify, keep, nil)
+	verifyFiles := opts.Verify || releaseSet.authenticated
+	fetch.PlanJobs(plannedJobs, verifyFiles, keep)
+	states, err := fetch.Many(ctx, src, indexJobs, opts.Workers, verifyFiles, keep, nil)
 	if err != nil {
 		return fmt.Errorf("fetch suite indexes: %w", err)
 	}
@@ -271,9 +412,14 @@ func syncDeb(ctx context.Context, src *fetch.Source, repoURL string, opts *Optio
 	}
 	log.WithField("files", len(poolJobs)).Info("Synchronizing pool files.")
 	if opts.DryRun {
-		fetch.PlanJobs(poolJobs, opts.Verify, keep)
-	} else if _, err := fetch.Many(ctx, src, poolJobs, opts.Workers, opts.Verify, keep, miss); err != nil {
+		fetch.PlanJobs(poolJobs, verifyFiles, keep)
+	} else if _, err := fetch.Many(ctx, src, poolJobs, opts.Workers, verifyFiles, keep, miss); err != nil {
 		return fmt.Errorf("fetch pool files: %w", err)
+	}
+	if releaseSet.authenticated {
+		if err := miss.Finish(); err != nil {
+			return err
+		}
 	}
 
 	// Promote the staged indexes now the pool files they reference exist.
@@ -291,9 +437,12 @@ func syncDeb(ctx context.Context, src *fetch.Source, repoURL string, opts *Optio
 
 	// Promote the release files last to complete the metadata chain.
 	for _, name := range []string{"Release.gpg", "Release", "InRelease"} {
-		dst, err := fetch.LocalJoin(destSuite, name)
-		if err != nil {
-			return err
+		dst := releaseSet.dsts[name]
+		if releaseSet.missing[name] {
+			if !opts.DryRun {
+				fetch.RemoveStale(dst)
+			}
+			continue
 		}
 		if err := fetch.PromoteOrDiscard(dst, opts.DryRun); err != nil {
 			return err
@@ -320,8 +469,9 @@ func syncDeb(ctx context.Context, src *fetch.Source, repoURL string, opts *Optio
 		}
 	}
 
-	// The suite is published either way; missing pool files only decide
-	// whether the run reports itself as failed.
+	if releaseSet.authenticated {
+		return nil
+	}
 	return miss.Finish()
 }
 

@@ -19,6 +19,7 @@ import (
 
 	cfg "github.com/grmrgecko/repo-sync/config"
 	"github.com/grmrgecko/repo-sync/fetch"
+	"github.com/grmrgecko/repo-sync/mirror"
 	"github.com/grmrgecko/repo-sync/state"
 	log "github.com/sirupsen/logrus"
 )
@@ -209,9 +210,39 @@ func handleOnline(w http.ResponseWriter, r *http.Request, domain cfg.DomainConfi
 	if res.Kind == kindGeneric {
 		// Files under a registered repository keep it alive and are
 		// fetched on demand until its crawl completes.
-		if state.S.TouchRepoMembers(reqPath, now) {
+		members := state.S.TouchRepoMembers(reqPath, now)
+		if len(members) > 0 {
 			if _, exists := regularFile(local); !exists {
-				if err := fetchUpstream(r.Context(), domain.Root, reqPath, false); err != nil {
+				var protectedKey string
+				var protectedEntry state.Entry
+				for key, entry := range members {
+					if protectedRepositoryKind(entry.Kind) && cfg.C.Crawler.SignatureMode != string(mirror.SignatureOff) {
+						protectedKey = key
+						protectedEntry = entry
+						break
+					}
+				}
+				var err error
+				if protectedKey != "" {
+					settings, settingsErr := loadSignatureSettings(cfg.C)
+					protectedRes := resource{
+						Kind:    protectedEntry.Kind,
+						Key:     protectedKey,
+						Path:    protectedEntry.Path,
+						Root:    protectedEntry.Root,
+						ReqPath: protectedEntry.Path,
+					}
+					err = crawlProtectedRepository(r.Context(), protectedRes, false, settings, settingsErr)
+					if err == nil {
+						_, exists = regularFile(local)
+						if !exists {
+							err = fmt.Errorf("fetch %s: %w", reqPath, fetch.ErrNotFound)
+						}
+					}
+				} else {
+					err = fetchUpstream(r.Context(), domain.Root, reqPath, false)
+				}
+				if err != nil {
 					writeFetchError(w, err)
 					return
 				}
@@ -233,8 +264,30 @@ func handleOnline(w http.ResponseWriter, r *http.Request, domain cfg.DomainConfi
 	entry, tracked := state.S.MarkRequested(res.Kind, res.Key, res.Path, res.Root, now)
 	_, exists := regularFile(local)
 	needCrawl := entry.LastCrawled.IsZero() || (!exists && entry.LastError != "")
-	if !exists {
-		if err := fetchUpstream(r.Context(), domain.Root, reqPath, false); err != nil {
+	conf := cfg.C
+	protected := protectedRepositoryKind(res.Kind) && conf.Crawler.SignatureMode != string(mirror.SignatureOff)
+	var signatureSettings signatureSettings
+	var signatureSettingsErr error
+	if protected {
+		signatureSettings, signatureSettingsErr = loadSignatureSettings(conf)
+	}
+	artifactsPresent := protected && signaturePolicyArtifactsPresent(conf, res, signatureSettings.mode)
+	needsSignatureCheck := protected && (signatureSettingsErr != nil || entry.SignaturePolicy != signatureSettings.policy || !artifactsPresent)
+	if !exists || needsSignatureCheck {
+		var err error
+		if protected {
+			// A protected entry point cannot be served until the crawl has
+			// verified and published its metadata generation.
+			err = crawlProtectedRepository(r.Context(), res, artifactsPresent, signatureSettings, signatureSettingsErr)
+			needCrawl = false
+			_, exists = regularFile(local)
+			if err == nil && !exists {
+				err = fmt.Errorf("fetch %s: %w", reqPath, fetch.ErrNotFound)
+			}
+		} else {
+			err = fetchUpstream(r.Context(), domain.Root, reqPath, false)
+		}
+		if err != nil {
 			// A path whose first contact failed was never shown to be a
 			// repository, so the registration this request created is
 			// dropped and the scheduler never crawls it. Registrations an

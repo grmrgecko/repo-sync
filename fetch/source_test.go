@@ -3,10 +3,14 @@ package fetch
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 
 	"github.com/grmrgecko/repo-sync/internal/testrepos"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestParseMirrorlist verifies URL extraction, comment skipping, and
@@ -45,6 +49,20 @@ func TestSourceFailover(t *testing.T) {
 	if _, err := src.Get(context.Background(), "no/such/file", GetOptions{}); !errors.Is(err, ErrNotFound) {
 		t.Errorf("expected ErrNotFound, got %v", err)
 	}
+}
+
+// TestSourceForbidden verifies HTTP 403 remains distinct from a missing file
+// so only callers fetching optional object-store keys can ignore it.
+func TestSourceForbidden(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+	}))
+	t.Cleanup(srv.Close)
+
+	_, err := NewSource([]string{srv.URL}).Get(context.Background(), "private", GetOptions{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrForbidden)
+	assert.NotErrorIs(t, err, ErrNotFound)
 }
 
 // TestParseMetalink verifies base URL extraction from metalink documents.

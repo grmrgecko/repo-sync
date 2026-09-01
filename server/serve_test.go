@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,8 @@ import (
 	"github.com/grmrgecko/repo-sync/internal/testrepos"
 	"github.com/grmrgecko/repo-sync/mirror"
 	"github.com/grmrgecko/repo-sync/state"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // serverFixture builds an upstream with one repository of each type plus a
@@ -463,6 +466,103 @@ func TestServeSiblingEntryPointMiss(t *testing.T) {
 			t.Errorf("%s deregistered %s", tc.missing, tc.key)
 		}
 	}
+}
+
+// TestServeRejectsUnverifiedRPMEntryPoint verifies the first request cannot
+// serve cached repomd.xml before its required signature has been checked.
+func TestServeRejectsUnverifiedRPMEntryPoint(t *testing.T) {
+	www := t.TempDir()
+	repoDir := filepath.Join(www, "repo")
+	testrepos.BuildRPMRepo(t, repoDir)
+	key := testrepos.NewSigningKey(t)
+	key.SignRPMRepo(t, repoDir)
+	repomd := filepath.Join(repoDir, "repodata", "repomd.xml")
+	data, err := os.ReadFile(repomd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testrepos.WriteFile(t, repomd, append(data, '\n'))
+	upstream := testrepos.ServeDir(t, www)
+
+	onlineRoot := t.TempDir()
+	local := filepath.Join(onlineRoot, "repo", "repodata", "repomd.xml")
+	testrepos.WriteFile(t, local, []byte("unverified cached metadata"))
+	confDir := t.TempDir()
+	confPath := filepath.Join(confDir, "config.yaml")
+	testrepos.WriteFile(t, confPath, []byte(fmt.Sprintf(`
+state_path: %s/state.yaml
+domains:
+  - {domain: 127.0.0.1, role: online, root: %s}
+mounts:
+  - {path: /, upstream: %s}
+crawler:
+  signature_mode: required
+`, confDir, onlineRoot, upstream.URL)))
+	if err := cfg.Init(confPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.Load(); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(Handler())
+	t.Cleanup(srv.Close)
+
+	resp, _ := get(t, srv, "", "/repo/repodata/repomd.xml")
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("repomd status = %d, want 502", resp.StatusCode)
+	}
+	got, err := os.ReadFile(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "unverified cached metadata" {
+		t.Error("failed verification replaced the cached repomd.xml")
+	}
+}
+
+// TestServeRejectsUnverifiedDebEntryPoint verifies a cached InRelease cannot
+// bypass the synchronous signature gate on its first request.
+func TestServeRejectsUnverifiedDebEntryPoint(t *testing.T) {
+	www := t.TempDir()
+	repoDir := filepath.Join(www, "debian")
+	testrepos.BuildDebRepo(t, repoDir)
+	key := testrepos.NewSigningKey(t)
+	key.SignDebRepo(t, repoDir)
+	inRelease := filepath.Join(repoDir, "dists", "test", "InRelease")
+	signedRelease, err := os.ReadFile(inRelease)
+	require.NoError(t, err)
+	tampered := bytes.Replace(signedRelease, []byte("Origin: Test"), []byte("Origin: Pest"), 1)
+	require.NoError(t, os.WriteFile(inRelease, tampered, 0644))
+	upstream := testrepos.ServeDir(t, www)
+
+	onlineRoot := t.TempDir()
+	local := filepath.Join(onlineRoot, "debian", "dists", "test", "InRelease")
+	testrepos.WriteFile(t, local, []byte("unverified cached metadata"))
+	confDir := t.TempDir()
+	keyPath := filepath.Join(confDir, "repository.asc")
+	testrepos.WriteFile(t, keyPath, key.PublicKey(t))
+	confPath := filepath.Join(confDir, "config.yaml")
+	testrepos.WriteFile(t, confPath, []byte(fmt.Sprintf(`
+state_path: %s/state.yaml
+domains:
+  - {domain: 127.0.0.1, role: online, root: %s}
+mounts:
+  - {path: /, upstream: %s}
+crawler:
+  signature_mode: required
+  gpg_keys: [%s]
+  keyservers: []
+`, confDir, onlineRoot, upstream.URL, keyPath)))
+	require.NoError(t, cfg.Init(confPath))
+	require.NoError(t, state.Load())
+	srv := httptest.NewServer(Handler())
+	t.Cleanup(srv.Close)
+
+	resp, _ := get(t, srv, "", "/debian/dists/test/InRelease")
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	got, err := os.ReadFile(local)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("unverified cached metadata"), got, "failed verification must retain the cached InRelease")
 }
 
 // TestServeUnresolvedEntryPoint verifies a path that only looks like a

@@ -99,6 +99,10 @@ func (s *Source) Get(ctx context.Context, reqPath string, o GetOptions) (*http.R
 			resp.Body.Close()
 			return nil, fmt.Errorf("fetch %s: %w", target, ErrNotFound)
 		}
+		if resp.StatusCode == http.StatusForbidden {
+			resp.Body.Close()
+			return nil, fmt.Errorf("fetch %s: %w", target, ErrForbidden)
+		}
 		if resp.StatusCode == http.StatusNotModified && !o.ModifiedSince.IsZero() {
 			resp.Body.Close()
 			return nil, fmt.Errorf("fetch %s: %w", target, ErrNotModified)

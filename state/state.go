@@ -32,6 +32,9 @@ type Entry struct {
 	NextCrawl           time.Time `yaml:"next_crawl,omitempty"`
 	LastSeenInInventory time.Time `yaml:"last_seen_in_inventory,omitempty"`
 	LastError           string    `yaml:"last_error,omitempty"`
+	// SignaturePolicy records the verification settings applied by the last
+	// successful crawl.
+	SignaturePolicy string `yaml:"signature_policy,omitempty"`
 }
 
 // file is the on-disk YAML layout.
@@ -137,6 +140,19 @@ func (s *Store) MarkCrawled(key string, now time.Time, crawlErr error) {
 	s.dirty = true
 }
 
+// MarkSignaturePolicy records the signature policy completed by a successful
+// repository crawl.
+func (s *Store) MarkSignaturePolicy(key, policy string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.file.Entries[key]
+	if e == nil || e.SignaturePolicy == policy {
+		return
+	}
+	e.SignaturePolicy = policy
+	s.dirty = true
+}
+
 // Delete removes a resource from tracking.
 func (s *Store) Delete(key string) {
 	s.mu.Lock()
@@ -169,14 +185,13 @@ func (s *Store) Snapshot() map[string]Entry {
 	return out
 }
 
-// TouchRepoMembers refreshes the last-requested time of every repository
-// whose root covers a request path, keeping repositories alive while their
-// files are fetched. It reports whether any repository matched.
-func (s *Store) TouchRepoMembers(reqPath string, now time.Time) bool {
+// TouchRepoMembers refreshes every repository whose root covers a request
+// path and returns copies keyed by their state keys.
+func (s *Store) TouchRepoMembers(reqPath string, now time.Time) map[string]Entry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	matched := false
-	for _, e := range s.file.Entries {
+	matched := map[string]Entry{}
+	for key, e := range s.file.Entries {
 		if e.Kind == "generic" || e.Root == "" {
 			continue
 		}
@@ -186,7 +201,7 @@ func (s *Store) TouchRepoMembers(reqPath string, now time.Time) bool {
 			continue
 		}
 		e.LastRequested = now
-		matched = true
+		matched[key] = *e
 		s.dirty = true
 	}
 	return matched

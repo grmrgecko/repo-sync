@@ -33,6 +33,10 @@ type SyncArgs struct {
 	Verify  bool `help:"Re-verify checksums of files that already exist locally."`
 	Prune   bool `help:"Delete local files that are no longer part of the repository."`
 
+	SignatureMode string   `help:"OpenPGP metadata signature policy: off, if-present, or required; defaults to the configured crawler policy." enum:",off,if-present,required" default:""`
+	GPGKey        []string `help:"Public keyring file used for metadata signature checks; repeatable." type:"existingfile"`
+	Keyserver     []string `help:"OpenPGP keyserver used to retrieve unknown signature issuers; repeatable and defaults to the configured crawler keyservers."`
+
 	Exclude     []string `help:"Glob of directory or file names discovery never crawls; repeatable, and matched against the path below the crawled URL when it contains a slash, which a leading slash anchors to that URL (e.g. sles, 'yum/docker*', /docker)."`
 	IncludeFile []string `help:"Glob of loose files found outside repositories that discovery mirrors as well; repeatable, and matched by path on the same rules as --exclude (e.g. '*.rpm', 'RPM-GPG-KEY-*', '/*.rpm')."`
 
@@ -103,9 +107,28 @@ func (s *SyncArgs) options(types []mirror.RepoType) (*mirror.Options, error) {
 	if s.DiscoverCache < 0 {
 		s.DiscoverCache = cfg.C.Crawler.DiscoverCache
 	}
+	if s.SignatureMode == "" {
+		s.SignatureMode = cfg.C.Crawler.SignatureMode
+	}
+	if len(s.GPGKey) == 0 {
+		s.GPGKey = append([]string(nil), cfg.C.Crawler.GPGKeys...)
+	}
+	if len(s.Keyserver) == 0 {
+		s.Keyserver = append([]string(nil), cfg.C.Crawler.Keyservers...)
+	}
 	missing, err := fetch.ParseMissingMode(s.Missing)
 	if err != nil {
 		return nil, err
+	}
+	signatures, err := mirror.ParseSignatureMode(s.SignatureMode)
+	if err != nil {
+		return nil, err
+	}
+	for _, raw := range s.Keyserver {
+		u, err := url.Parse(raw)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return nil, fmt.Errorf("invalid keyserver URL %q", raw)
+		}
 	}
 	opts := &mirror.Options{
 		Types:          types,
@@ -120,6 +143,9 @@ func (s *SyncArgs) options(types []mirror.RepoType) (*mirror.Options, error) {
 		IncludeFiles:   s.IncludeFile,
 		Workers:        s.Workers,
 		Verify:         s.Verify,
+		SignatureMode:  signatures,
+		GPGKeys:        s.GPGKey,
+		Keyservers:     s.Keyserver,
 		Prune:          s.Prune,
 		PruneGrace:     s.PruneGrace,
 		DryRun:         s.DryRun,

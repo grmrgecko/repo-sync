@@ -117,6 +117,19 @@ crawler:
   # which repositories the upstream has dropped since. Zero scans on every
   # run.
   discover_cache: 72h
+  # signature_mode controls OpenPGP checks for signed repository metadata.
+  # if-present accepts unsigned repositories but rejects a signature that
+  # cannot be verified. required also rejects missing signatures.
+  signature_mode: off
+  # When local public keyrings are configured, only their signers are
+  # accepted. Without them, repository-provided and keyserver-retrieved keys
+  # can prove that a data/signature pair matches but not who published it.
+  gpg_keys: []
+  # The configured list replaces the defaults. Set it to [] to disable
+  # keyserver lookup.
+  keyservers:
+    - https://keyserver.ubuntu.com
+    - https://keys.openpgp.org
   # Backoff steps applied once a repository stops being requested. The
   # first tier is repo_crawl_interval; each entry extends the refresh
   # interval as the resource ages, and once the total budget elapses the

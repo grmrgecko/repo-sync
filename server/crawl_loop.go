@@ -2,7 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -156,9 +159,151 @@ func crawlResource(ctx context.Context, res resource) error {
 	}
 	defer lockResource(res.Key)()
 
-	err := dispatchCrawl(ctx, res)
+	return crawlResourceLocked(ctx, res)
+}
+
+// crawlResourceLocked synchronizes a resource whose repository locks are
+// already held.
+func crawlResourceLocked(ctx context.Context, res resource) error {
+	settings := signatureSettings{mode: mirror.SignatureOff}
+	protected := protectedRepositoryKind(res.Kind) && cfg.C.Crawler.SignatureMode != string(mirror.SignatureOff)
+	var err error
+	if protected {
+		settings, err = loadSignatureSettings(cfg.C)
+	}
+	if err == nil {
+		err = dispatchCrawl(ctx, res, settings)
+	}
 	state.S.MarkCrawled(res.Key, time.Now(), err)
+	if err == nil && protected {
+		state.S.MarkSignaturePolicy(res.Key, settings.policy)
+	}
 	return err
+}
+
+// crawlProtectedRepository verifies a repository synchronously before its
+// entry point is served under an active signature policy.
+func crawlProtectedRepository(ctx context.Context, res resource, artifactsPresent bool, settings signatureSettings, settingsErr error) error {
+	acquireCrawlSlot()
+	defer releaseCrawlSlot()
+	if res.Kind == string(mirror.RepoDeb) && res.Root != res.Path {
+		defer lockResource("deb-root:" + res.Root)()
+	}
+	defer lockResource(res.Key)()
+	if settingsErr != nil {
+		state.S.MarkCrawled(res.Key, time.Now(), settingsErr)
+		return settingsErr
+	}
+	if entry, ok := state.S.Entry(res.Key); ok && entry.SignaturePolicy == settings.policy && entry.LastError == "" {
+		if artifactsPresent {
+			return nil
+		}
+	}
+	err := dispatchCrawl(ctx, res, settings)
+	state.S.MarkCrawled(res.Key, time.Now(), err)
+	if err == nil {
+		state.S.MarkSignaturePolicy(res.Key, settings.policy)
+	}
+	return err
+}
+
+// signaturePolicyArtifactsPresent reports whether a repository still has the
+// entry-point files required by its active signature policy.
+func signaturePolicyArtifactsPresent(conf *cfg.Config, res resource, mode mirror.SignatureMode) bool {
+	repo, err := fetch.LocalJoin(conf.OnlineDomain().Root, res.Path)
+	if err != nil {
+		return false
+	}
+	switch mirror.RepoType(res.Kind) {
+	case mirror.RepoRPM:
+		repomd, err := fetch.LocalJoin(repo, "repodata/repomd.xml")
+		if err != nil {
+			return false
+		}
+		if _, exists := regularFile(repomd); !exists {
+			return false
+		}
+		if mode != mirror.SignatureRequired {
+			return true
+		}
+		signature, err := fetch.LocalJoin(repo, "repodata/repomd.xml.asc")
+		if err != nil {
+			return false
+		}
+		_, exists := regularFile(signature)
+		return exists
+	case mirror.RepoDeb:
+		inRelease, _ := fetch.LocalJoin(repo, "InRelease")
+		if _, exists := regularFile(inRelease); exists {
+			return true
+		}
+		release, _ := fetch.LocalJoin(repo, "Release")
+		if _, exists := regularFile(release); !exists {
+			return false
+		}
+		if mode != mirror.SignatureRequired {
+			return true
+		}
+		signature, _ := fetch.LocalJoin(repo, "Release.gpg")
+		_, exists := regularFile(signature)
+		return exists
+	case mirror.RepoArch:
+		if !strings.HasSuffix(res.ReqPath, ".db") {
+			return false
+		}
+		database, err := fetch.LocalJoin(conf.OnlineDomain().Root, res.ReqPath)
+		if err != nil {
+			return false
+		}
+		_, exists := regularFile(database)
+		return exists
+	default:
+		return false
+	}
+}
+
+// signatureSettings is one immutable verification configuration used for
+// both a crawl and its persisted policy identity.
+type signatureSettings struct {
+	mode       mirror.SignatureMode
+	keyData    [][]byte
+	keyservers []string
+	policy     string
+}
+
+// loadSignatureSettings snapshots key contents before a crawl so a reload
+// cannot change verification inputs halfway through it.
+func loadSignatureSettings(conf *cfg.Config) (signatureSettings, error) {
+	mode, err := mirror.ParseSignatureMode(conf.Crawler.SignatureMode)
+	if err != nil {
+		return signatureSettings{}, err
+	}
+	settings := signatureSettings{
+		mode:       mode,
+		keyservers: append([]string(nil), conf.Crawler.Keyservers...),
+	}
+	h := sha256.New()
+	_, _ = io.WriteString(h, "repository-openpgp-v1\x00"+string(mode)+"\x00")
+	for _, name := range conf.Crawler.GPGKeys {
+		_, _ = io.WriteString(h, name+"\x00")
+		data, err := os.ReadFile(name)
+		if err != nil {
+			return signatureSettings{}, fmt.Errorf("read GPG key %s: %w", name, err)
+		}
+		settings.keyData = append(settings.keyData, data)
+		_, _ = h.Write(data)
+		_, _ = io.WriteString(h, "\x00")
+	}
+	for _, server := range settings.keyservers {
+		_, _ = io.WriteString(h, server+"\x00")
+	}
+	settings.policy = hex.EncodeToString(h.Sum(nil))
+	return settings, nil
+}
+
+// protectedRepositoryKind reports formats covered by the OpenPGP policy.
+func protectedRepositoryKind(kind string) bool {
+	return kind == string(mirror.RepoRPM) || kind == string(mirror.RepoDeb) || kind == string(mirror.RepoArch)
 }
 
 // pathBelow reports whether a request path sits strictly below a base path.
@@ -217,7 +362,7 @@ func traceInfo(t cfg.TraceConfig) mirror.TraceInfo {
 
 // dispatchCrawl runs the format-specific synchronization for a resource
 // into the online tree.
-func dispatchCrawl(ctx context.Context, res resource) error {
+func dispatchCrawl(ctx context.Context, res resource, signatures signatureSettings) error {
 	online := cfg.C.OnlineDomain()
 	mount, ok := cfg.C.MountFor(res.Path)
 	if !ok {
@@ -237,7 +382,6 @@ func dispatchCrawl(ctx context.Context, res resource) error {
 	if err != nil {
 		return err
 	}
-
 	// Generic files never reach the crawl path: they refresh on demand at
 	// serve time and expire through the failure cache and state eviction.
 	typ := mirror.RepoType(res.Kind)
@@ -248,6 +392,9 @@ func dispatchCrawl(ctx context.Context, res resource) error {
 		PruneGrace:     cfg.C.Crawler.PruneGrace,
 		Missing:        missing,
 		MissingRetries: cfg.C.Crawler.MissingRetries,
+		SignatureMode:  signatures.mode,
+		GPGKeyData:     signatures.keyData,
+		Keyservers:     signatures.keyservers,
 		Trace:          cfg.C.Trace.Enabled,
 		TraceInfo:      traceInfo(cfg.C.Trace),
 	}

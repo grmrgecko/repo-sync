@@ -12,6 +12,278 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	rpmRepomdPath = "repodata/repomd.xml"
+	rpmSigPath    = "repodata/repomd.xml.asc"
+	rpmKeyPath    = "repodata/repomd.xml.key"
+)
+
+// rpmRoot is one staged repomd generation and its optional signature
+// material.
+type rpmRoot struct {
+	repomdDst     string
+	sigDst        string
+	keyDst        string
+	sigMissing    bool
+	keyMissing    bool
+	authenticated bool
+}
+
+// rpmPublishedFile is a rollback copy of one live root metadata file.
+type rpmPublishedFile struct {
+	path   string
+	data   []byte
+	mode   os.FileMode
+	exists bool
+}
+
+// rpmWithdrawnPackage is a stale package hidden until root publication
+// succeeds or restored if publication fails.
+type rpmWithdrawnPackage struct {
+	path   string
+	backup string
+}
+
+// cleanup removes unpublished files left from staging a repomd generation.
+func (r *rpmRoot) cleanup() {
+	for _, name := range []string{r.repomdDst, r.sigDst, r.keyDst} {
+		_ = os.Remove(name + fetch.StagedSuffix)
+	}
+}
+
+// stageRPMRoot stages and optionally verifies repomd.xml with its detached
+// signature. A failed check refetches the complete set once because an
+// upstream rotation can occur between the requests.
+func stageRPMRoot(ctx context.Context, src *fetch.Source, destDir string, opts *Options) (*rpmRoot, error) {
+	r := &rpmRoot{}
+	var err error
+	if r.repomdDst, err = fetch.LocalJoin(destDir, rpmRepomdPath); err != nil {
+		return nil, err
+	}
+	if r.sigDst, err = fetch.LocalJoin(destDir, rpmSigPath); err != nil {
+		return nil, err
+	}
+	if r.keyDst, err = fetch.LocalJoin(destDir, rpmKeyPath); err != nil {
+		return nil, err
+	}
+
+	mode := opts.SignatureMode
+	if mode == "" {
+		mode = SignatureOff
+	}
+	var verifier *signatureVerifier
+	if mode != SignatureOff {
+		verifier, err = newSignatureVerifier(opts)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for attempt := 0; attempt < 2; attempt++ {
+		fresh := attempt > 0
+		file := fetch.File
+		if fresh {
+			file = func(ctx context.Context, src *fetch.Source, reqPath, dst string, want *fetch.Expect, stage, _ bool) (fetch.FileState, error) {
+				return fetch.FileFresh(ctx, src, reqPath, dst, want, stage)
+			}
+		}
+		if _, err := file(ctx, src, rpmRepomdPath, r.repomdDst, nil, true, false); err != nil {
+			r.cleanup()
+			return nil, fmt.Errorf("fetch repomd.xml: %w", err)
+		}
+
+		r.sigMissing = false
+		r.keyMissing = false
+		for _, extra := range []struct {
+			req     string
+			dst     string
+			missing *bool
+		}{
+			{rpmSigPath, r.sigDst, &r.sigMissing},
+			{rpmKeyPath, r.keyDst, &r.keyMissing},
+		} {
+			_, err := file(ctx, src, extra.req, extra.dst, nil, true, false)
+			switch {
+			case err == nil:
+			case errors.Is(err, fetch.ErrNotFound), errors.Is(err, fetch.ErrForbidden):
+				*extra.missing = true
+			case err != nil:
+				r.cleanup()
+				return nil, fmt.Errorf("fetch %s: %w", extra.req, err)
+			}
+		}
+
+		if mode == SignatureOff {
+			return r, nil
+		}
+		if r.sigMissing {
+			if mode == SignatureRequired {
+				r.cleanup()
+				return nil, errors.New("repository signature is required but repomd.xml.asc is missing")
+			}
+			return r, nil
+		}
+
+		keyPath := ""
+		if !r.keyMissing {
+			keyPath = fetch.StagedOrFinal(r.keyDst)
+		}
+		fingerprint, verifyErr := verifier.verifyDetached(
+			ctx,
+			fetch.StagedOrFinal(r.repomdDst),
+			fetch.StagedOrFinal(r.sigDst),
+			keyPath,
+		)
+		if verifyErr == nil {
+			r.authenticated = true
+			log.WithField("fingerprint", fingerprint).Debug("Verified repomd.xml signature.")
+			return r, nil
+		}
+		if !fresh {
+			log.WithError(verifyErr).Warn("Staged repomd.xml signature failed verification; refetching the pair.")
+			continue
+		}
+		r.cleanup()
+		return nil, fmt.Errorf("verify repomd.xml signature after refetch: %w", verifyErr)
+	}
+	return nil, errors.New("unable to stage repomd.xml")
+}
+
+// snapshotRPMRoot reads the current live root set before publication.
+func snapshotRPMRoot(paths ...string) ([]rpmPublishedFile, error) {
+	files := make([]rpmPublishedFile, 0, len(paths))
+	for _, name := range paths {
+		file := rpmPublishedFile{path: name}
+		info, err := os.Stat(name)
+		if os.IsNotExist(err) {
+			files = append(files, file)
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		file.data, err = os.ReadFile(name)
+		if err != nil {
+			return nil, err
+		}
+		file.mode = info.Mode()
+		file.exists = true
+		files = append(files, file)
+	}
+	return files, nil
+}
+
+// restoreRPMRoot replaces a partially published root with its prior files.
+func restoreRPMRoot(files []rpmPublishedFile) error {
+	var errs []error
+	for _, file := range files {
+		if !file.exists {
+			if err := os.Remove(file.path); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, err)
+			}
+			continue
+		}
+		tmp := file.path + ".rollback" + fetch.StagedSuffix
+		if err := os.WriteFile(tmp, file.data, file.mode); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if err := os.Rename(tmp, file.path); err != nil {
+			_ = os.Remove(tmp)
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// withdrawMissingPackages hides checksum-invalid packages the authenticated
+// root no longer provides upstream.
+func withdrawMissingPackages(jobs []fetch.Job, states []fetch.FileState) ([]rpmWithdrawnPackage, error) {
+	var withdrawn []rpmWithdrawnPackage
+	for i, state := range states {
+		if state != fetch.FileMissing {
+			continue
+		}
+		if _, err := os.Stat(jobs[i].Dst); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return withdrawn, err
+		}
+		backup := jobs[i].Dst + ".withdrawn" + fetch.StagedSuffix
+		if err := os.Remove(backup); err != nil && !os.IsNotExist(err) {
+			return withdrawn, err
+		}
+		if err := os.Rename(jobs[i].Dst, backup); err != nil {
+			return withdrawn, err
+		}
+		withdrawn = append(withdrawn, rpmWithdrawnPackage{path: jobs[i].Dst, backup: backup})
+	}
+	return withdrawn, nil
+}
+
+// finishWithdrawnPackages removes hidden packages after publication or puts
+// them back when publication fails.
+func finishWithdrawnPackages(files []rpmWithdrawnPackage, published bool) error {
+	var errs []error
+	for _, file := range files {
+		if published {
+			if err := os.Remove(file.backup); err != nil && !os.IsNotExist(err) {
+				errs = append(errs, err)
+			}
+			continue
+		}
+		if err := os.Rename(file.backup, file.path); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// publishRPMRoot publishes signature material immediately before repomd.xml.
+// Missing optional files are removed only after the replacement is ready.
+func publishRPMRoot(r *rpmRoot, keep *fetch.KeepSet, dryRun bool) (retErr error) {
+	var published []rpmPublishedFile
+	if !dryRun {
+		var err error
+		published, err = snapshotRPMRoot(r.keyDst, r.sigDst, r.repomdDst)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if retErr != nil {
+				retErr = errors.Join(retErr, restoreRPMRoot(published))
+			}
+		}()
+	}
+	for _, extra := range []struct {
+		dst     string
+		missing bool
+	}{
+		{r.keyDst, r.keyMissing},
+		{r.sigDst, r.sigMissing},
+	} {
+		if extra.missing {
+			if !dryRun {
+				if err := os.Remove(extra.dst); err != nil && !os.IsNotExist(err) {
+					return err
+				}
+			}
+			continue
+		}
+		if err := fetch.PromoteOrDiscard(extra.dst, dryRun); err != nil {
+			return err
+		}
+		if _, err := os.Stat(extra.dst); err == nil {
+			keep.Add(extra.dst)
+		}
+	}
+	if err := fetch.PromoteOrDiscard(r.repomdDst, dryRun); err != nil {
+		return err
+	}
+	keep.Add(r.repomdDst)
+	return nil
+}
+
 // repoMD is the partial XML schema for a yum repomd.xml file. Only the
 // fields the sync needs are decoded; unknown elements are ignored so
 // upstream additions do not break parsing.
@@ -58,16 +330,13 @@ func syncRPM(ctx context.Context, src *fetch.Source, destDir string, opts *Optio
 	tr := newTrace(opts)
 	ctx = tr.track(ctx)
 
-	// Stage repomd.xml so clients of a live tree keep a consistent view of
-	// the old repository until everything else is in place.
-	repomdDst, err := fetch.LocalJoin(destDir, "repodata/repomd.xml")
+	// Authenticate the root metadata before using it to select any files.
+	root, err := stageRPMRoot(ctx, src, destDir, opts)
 	if err != nil {
 		return err
 	}
-	if _, err := fetch.File(ctx, src, "repodata/repomd.xml", repomdDst, nil, true, false); err != nil {
-		return fmt.Errorf("fetch repomd.xml: %w", err)
-	}
-	md, err := readRepomd(fetch.StagedOrFinal(repomdDst))
+	defer root.cleanup()
+	md, err := readRepomd(fetch.StagedOrFinal(root.repomdDst))
 	if err != nil {
 		return err
 	}
@@ -111,8 +380,9 @@ func syncRPM(ctx context.Context, src *fetch.Source, destDir string, opts *Optio
 		}
 		jobs = append(jobs, job)
 	}
-	fetch.PlanJobs(planned, opts.Verify, keep)
-	if _, err := fetch.Many(ctx, src, jobs, opts.Workers, opts.Verify, keep, nil); err != nil {
+	verifyMetadata := opts.Verify || root.authenticated
+	fetch.PlanJobs(planned, verifyMetadata, keep)
+	if _, err := fetch.Many(ctx, src, jobs, opts.Workers, verifyMetadata, keep, nil); err != nil {
 		return fmt.Errorf("fetch repository metadata: %w", err)
 	}
 	if primary == nil {
@@ -169,10 +439,15 @@ func syncRPM(ctx context.Context, src *fetch.Source, destDir string, opts *Optio
 		}
 	}
 	log.WithField("packages", len(jobs)).Info("Synchronizing packages.")
+	verifyPackages := opts.Verify || root.authenticated
+	var packageStates []fetch.FileState
 	if opts.DryRun {
-		fetch.PlanJobs(jobs, opts.Verify, keep)
-	} else if _, err := fetch.Many(ctx, src, jobs, opts.Workers, opts.Verify, keep, miss); err != nil {
-		return fmt.Errorf("fetch packages: %w", err)
+		fetch.PlanJobs(jobs, verifyPackages, keep)
+	} else {
+		packageStates, err = fetch.Many(ctx, src, jobs, opts.Workers, verifyPackages, keep, miss)
+		if err != nil {
+			return fmt.Errorf("fetch packages: %w", err)
+		}
 	}
 
 	// A dry run discards the indexes it staged for parsing.
@@ -180,43 +455,26 @@ func syncRPM(ctx context.Context, src *fetch.Source, destDir string, opts *Optio
 		_ = os.Remove(dst + fetch.StagedSuffix)
 	}
 
-	// Stage the optional signature material so it is published together
-	// with the repomd.xml it signs, never beside the previous index.
-	var sigDsts []string
-	for _, extra := range []string{"repodata/repomd.xml.asc", "repodata/repomd.xml.key"} {
-		dst, err := fetch.LocalJoin(destDir, extra)
-		if err != nil {
-			return err
-		}
-		_, err = fetch.File(ctx, src, extra, dst, nil, true, false)
-		switch {
-		case err == nil:
-			sigDsts = append(sigDsts, dst)
-		case errors.Is(err, fetch.ErrNotFound):
-			// The upstream dropped the signature; drop the local copy so
-			// a stale signature is never served beside a new repomd.xml.
-			if !opts.DryRun {
-				fetch.RemoveStale(dst)
-			}
-		default:
-			return fmt.Errorf("fetch %s: %w", extra, err)
-		}
-	}
-
-	// Promote the signatures and then repomd.xml so the published metadata
-	// chain is complete.
-	for _, dst := range sigDsts {
-		if err := fetch.PromoteOrDiscard(dst, opts.DryRun); err != nil {
-			return err
-		}
-		if _, err := os.Stat(dst); err == nil {
-			keep.Add(dst)
-		}
-	}
-	if err := fetch.PromoteOrDiscard(repomdDst, opts.DryRun); err != nil {
+	// Keep the previous root live until every referenced package is present
+	// under the configured missing-file policy.
+	if err := miss.Finish(); err != nil {
 		return err
 	}
-	keep.Add(repomdDst)
+	var withdrawn []rpmWithdrawnPackage
+	if root.authenticated {
+		withdrawn, err = withdrawMissingPackages(jobs, packageStates)
+		if err != nil {
+			_ = finishWithdrawnPackages(withdrawn, false)
+			return fmt.Errorf("withdraw stale packages: %w", err)
+		}
+	}
+	// Publish the verified root only after every referenced file is ready.
+	if err := publishRPMRoot(root, keep, opts.DryRun); err != nil {
+		return errors.Join(err, finishWithdrawnPackages(withdrawn, false))
+	}
+	if err := finishWithdrawnPackages(withdrawn, true); err != nil {
+		log.WithError(err).Warn("Unable to remove withdrawn package files.")
+	}
 
 	// Publish the traces, upstream's included, before pruning so the keep
 	// set covers them.
@@ -227,9 +485,7 @@ func syncRPM(ctx context.Context, src *fetch.Source, destDir string, opts *Optio
 		fetch.PruneTree(destDir, keep, opts.PruneGrace, opts.DryRun)
 	}
 
-	// The metadata is published either way; missing packages only decide
-	// whether the run reports itself as failed.
-	return miss.Finish()
+	return nil
 }
 
 // rpmDelta is one delta package referenced from prestodelta metadata.
