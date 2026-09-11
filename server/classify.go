@@ -67,8 +67,10 @@ func classifyRequest(reqPath string) resource {
 		}
 	}
 
-	// Pacman repositories are identified by their database file.
-	if strings.HasSuffix(base, ".db") {
+	// Pacman repositories are identified by their database file. Its
+	// detached signature is an entry point too: served as a plain file it
+	// could be refreshed apart from the database it signs.
+	if strings.HasSuffix(base, ".db") || strings.HasSuffix(base, ".db.sig") {
 		return resource{
 			Kind:    string(mirror.RepoArch),
 			Key:     string(mirror.RepoArch) + ":" + dir,

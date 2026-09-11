@@ -212,6 +212,10 @@ func handleOnline(w http.ResponseWriter, r *http.Request, domain cfg.DomainConfi
 		// fetched on demand until its crawl completes.
 		members := state.S.TouchRepoMembers(reqPath, now)
 		if len(members) > 0 {
+			// The repository's crawl owns the file from here on; a generic
+			// entry left by a request that predates the registration would
+			// otherwise expire and evict the file from the verified tree.
+			state.S.Delete(res.Key)
 			if _, exists := regularFile(local); !exists {
 				var protectedKey string
 				var protectedEntry state.Entry
@@ -275,11 +279,16 @@ func handleOnline(w http.ResponseWriter, r *http.Request, domain cfg.DomainConfi
 	needsSignatureCheck := protected && (signatureSettingsErr != nil || entry.SignaturePolicy != signatureSettings.policy || !artifactsPresent)
 	if !exists || needsSignatureCheck {
 		var err error
+		// A crawl that verified and published the repository proves the
+		// path is one, whether or not the requested entry point exists
+		// upstream.
+		verified := false
 		if protected {
 			// A protected entry point cannot be served until the crawl has
 			// verified and published its metadata generation.
 			err = crawlProtectedRepository(r.Context(), res, artifactsPresent, signatureSettings, signatureSettingsErr)
 			needCrawl = false
+			verified = err == nil
 			_, exists = regularFile(local)
 			if err == nil && !exists {
 				err = fmt.Errorf("fetch %s: %w", reqPath, fetch.ErrNotFound)
@@ -294,7 +303,9 @@ func handleOnline(w http.ResponseWriter, r *http.Request, domain cfg.DomainConfi
 			// earlier request established are kept: every entry point of one
 			// repository shares a key, so a repository serving Release but
 			// not InRelease would otherwise deregister itself on the miss.
-			if !tracked {
+			// A verified repository is kept for the same reason, or its
+			// member files would fall to the generic path unchecked.
+			if !tracked && !verified {
 				state.S.Delete(res.Key)
 			}
 			writeFetchError(w, err)

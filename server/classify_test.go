@@ -22,6 +22,8 @@ func TestClassifyRequest(t *testing.T) {
 		{"/debian/dists/stable/updates/Release", "deb", "/debian/dists/stable/updates", "/debian"},
 		{"/flat/Release", "deb", "/flat", "/flat"},
 		{"/archlinux/core/os/x86_64/core.db", "arch", "/archlinux/core/os/x86_64", "/archlinux/core/os/x86_64"},
+		{"/archlinux/core/os/x86_64/core.db.sig", "arch", "/archlinux/core/os/x86_64", "/archlinux/core/os/x86_64"},
+		{"/archlinux/core/os/x86_64/zlib-1.3-1-x86_64.pkg.tar.zst.sig", kindGeneric, "/archlinux/core/os/x86_64/zlib-1.3-1-x86_64.pkg.tar.zst.sig", ""},
 		{"/alpine/v3.24/main/x86_64/APKINDEX.tar.gz", "apk", "/alpine/v3.24/main/x86_64", "/alpine/v3.24/main/x86_64"},
 		{"/almalinux/9/BaseOS/x86_64/os/Packages/foo.rpm", kindGeneric, "/almalinux/9/BaseOS/x86_64/os/Packages/foo.rpm", ""},
 		{"/notes/README.txt", kindGeneric, "/notes/README.txt", ""},

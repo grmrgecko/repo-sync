@@ -248,10 +248,12 @@ func signaturePolicyArtifactsPresent(conf *cfg.Config, res resource, mode mirror
 		_, exists := regularFile(signature)
 		return exists
 	case mirror.RepoArch:
-		if !strings.HasSuffix(res.ReqPath, ".db") {
+		// A signature request is gated on the database it signs.
+		name := strings.TrimSuffix(res.ReqPath, ".sig")
+		if !strings.HasSuffix(name, ".db") {
 			return false
 		}
-		database, err := fetch.LocalJoin(conf.OnlineDomain().Root, res.ReqPath)
+		database, err := fetch.LocalJoin(conf.OnlineDomain().Root, name)
 		if err != nil {
 			return false
 		}
@@ -315,6 +317,20 @@ func pathBelow(p, base string) bool {
 		return true
 	}
 	return strings.HasPrefix(p, base+"/")
+}
+
+// repositoryOwns reports whether a registered repository's root covers a
+// request path, meaning its crawl is what keeps the file there current.
+func repositoryOwns(reqPath string) bool {
+	for _, entry := range state.S.Snapshot() {
+		if entry.Kind == kindGeneric || entry.Root == "" {
+			continue
+		}
+		if pathBelow(reqPath, entry.Root) {
+			return true
+		}
+	}
+	return false
 }
 
 // prunableTree reports whether a crawl may prune its destination tree. Every
@@ -592,6 +608,14 @@ func evictStale(key string, entry state.Entry) {
 
 	current, ok := state.S.Entry(key)
 	if ok && current.LastRequested.After(entry.LastRequested) {
+		return
+	}
+	// A plain file requested before its repository was registered keeps a
+	// generic entry that nothing refreshes. The file belongs to the
+	// repository's verified tree now, so only the bookkeeping goes.
+	if entry.Kind == kindGeneric && repositoryOwns(entry.Path) {
+		log.WithFields(log.Fields{"key": key, "path": entry.Path}).Debug("Dropped a generic entry for a repository member.")
+		state.S.Delete(key)
 		return
 	}
 	target, err := fetch.LocalJoin(cfg.C.OnlineDomain().Root, entry.Path)

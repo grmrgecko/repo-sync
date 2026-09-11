@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"compress/gzip"
 	"fmt"
 	"io"
 	"net/http"
@@ -584,4 +585,142 @@ func TestServeUnresolvedEntryPoint(t *testing.T) {
 			t.Errorf("%s left %s registered", tc.path, tc.key)
 		}
 	}
+}
+
+// archSignatureFixture serves one pacman repository, signed when a key is
+// given, behind a mirror enforcing the given signature mode. Upstream files
+// carry an hour-old modification time so a later rotation is visible to
+// conditional requests, which http.FileServer compares at second precision.
+func archSignatureFixture(t *testing.T, key *testrepos.SigningKey, mode string) (*httptest.Server, string, string) {
+	t.Helper()
+	www := t.TempDir()
+	repoDir := filepath.Join(www, "archlinux", "core", "os", "x86_64")
+	packages := testrepos.BuildArchRepo(t, repoDir, "core")
+	if key != nil {
+		key.SignArchRepo(t, repoDir, "core", packages)
+	} else {
+		// The fixture's placeholder package signatures would fail
+		// verification; an unsigned upstream publishes none.
+		for filename := range packages {
+			require.NoError(t, os.Remove(filepath.Join(repoDir, filename+".sig")))
+		}
+	}
+	old := time.Now().Add(-time.Hour)
+	entries, err := os.ReadDir(repoDir)
+	require.NoError(t, err)
+	for _, entry := range entries {
+		require.NoError(t, os.Chtimes(filepath.Join(repoDir, entry.Name()), old, old))
+	}
+	upstream := testrepos.ServeDir(t, www)
+
+	onlineRoot := t.TempDir()
+	confDir := t.TempDir()
+	keys := "[]"
+	if key != nil {
+		keyPath := filepath.Join(confDir, "repository.asc")
+		testrepos.WriteFile(t, keyPath, key.PublicKey(t))
+		keys = "[" + keyPath + "]"
+	}
+	confPath := filepath.Join(confDir, "config.yaml")
+	testrepos.WriteFile(t, confPath, []byte(fmt.Sprintf(`
+state_path: %s/state.yaml
+domains:
+  - {domain: 127.0.0.1, role: online, root: %s}
+mounts:
+  - {path: /, upstream: %s}
+crawler:
+  signature_mode: %s
+  gpg_keys: %s
+  keyservers: []
+`, confDir, onlineRoot, upstream.URL, mode, keys)))
+	require.NoError(t, cfg.Init(confPath))
+	require.NoError(t, state.Load())
+	srv := httptest.NewServer(Handler())
+	t.Cleanup(srv.Close)
+	t.Cleanup(WaitCrawls)
+	return srv, onlineRoot, repoDir
+}
+
+// TestServeArchSignatureEntryPoint verifies a pacman database signature is
+// never refreshed on its own. pacman fetches core.db and then core.db.sig,
+// so a mirror that revalidated the signature as a plain file after losing
+// the repository's registration would pair a rotated signature with the
+// database it still holds, and every client would fail verification until
+// the next crawl. The signature must take the same verified path as
+// Release.gpg and repomd.xml.asc.
+func TestServeArchSignatureEntryPoint(t *testing.T) {
+	key := testrepos.NewSigningKey(t)
+	srv, onlineRoot, repoDir := archSignatureFixture(t, key, "required")
+	repo := "/archlinux/core/os/x86_64"
+	localDB := filepath.Join(onlineRoot, "archlinux", "core", "os", "x86_64", "core.db")
+	localSig := localDB + ".sig"
+
+	resp, _ := get(t, srv, "", repo+"/core.db")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.FileExists(t, localSig, "the verifying crawl publishes the database signature")
+
+	// Model a restart that lost the state file: the tree is kept, the
+	// registration is gone.
+	state.S.Delete("arch:" + repo)
+
+	// Rotate the upstream: the database gains an empty trailing gzip member,
+	// which changes its bytes without changing its contents, and is re-signed.
+	upstreamDB := filepath.Join(repoDir, "core.db")
+	rotated, err := os.ReadFile(upstreamDB)
+	require.NoError(t, err)
+	var trailer bytes.Buffer
+	require.NoError(t, gzip.NewWriter(&trailer).Close())
+	rotated = append(rotated, trailer.Bytes()...)
+	require.NoError(t, os.WriteFile(upstreamDB, rotated, 0644))
+	key.SignArchRepo(t, repoDir, "core", nil)
+	rotatedSig, err := os.ReadFile(upstreamDB + ".sig")
+	require.NoError(t, err)
+
+	resp, body := get(t, srv, "", repo+"/core.db.sig")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	gotDB, err := os.ReadFile(localDB)
+	require.NoError(t, err)
+	assert.Equal(t, rotated, gotDB, "a signature request must publish the database it was verified against")
+	assert.Equal(t, rotatedSig, body, "the rotated signature is served once its pair is verified")
+	_, registered := state.S.Entry("arch:" + repo)
+	assert.True(t, registered, "a signature request registers the repository it belongs to")
+}
+
+// TestServeProtectedFirstContactMiss verifies a repository whose first
+// request is an entry point the upstream does not publish stays registered
+// once its crawl succeeded. Deregistering it would hand every member file
+// to the generic path, which refreshes files individually with no checksum
+// or signature check, until a later entry-point request re-registers it.
+func TestServeProtectedFirstContactMiss(t *testing.T) {
+	srv, onlineRoot, _ := archSignatureFixture(t, nil, "if-present")
+	repo := "/archlinux/core/os/x86_64"
+
+	resp, _ := get(t, srv, "", repo+"/core.db.sig")
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode, "the upstream publishes no database signature")
+	assert.FileExists(t, filepath.Join(onlineRoot, "archlinux", "core", "os", "x86_64", "core.db"), "the crawl published the repository")
+	_, registered := state.S.Entry("arch:" + repo)
+	assert.True(t, registered, "a crawled repository stays registered after a sibling entry-point miss")
+}
+
+// TestEvictStaleKeepsRepositoryMember verifies evicting a plain-file entry
+// leaves the file alone when a registered repository owns it. A file
+// requested before its repository was registered is tracked as generic;
+// deleting it from under the verified tree would force the next request into
+// a full synchronous crawl to restore it.
+func TestEvictStaleKeepsRepositoryMember(t *testing.T) {
+	_, onlineRoot, _ := serverFixture(t)
+	repo := "/archlinux/core/os/x86_64"
+	member := repo + "/zlib-1.3-1-x86_64.pkg.tar.zst"
+	local := filepath.Join(onlineRoot, filepath.FromSlash(member[1:]))
+	testrepos.WriteFile(t, local, []byte("package"))
+
+	now := time.Now()
+	state.S.MarkRequested(kindGeneric, kindGeneric+":"+member, member, "", now.Add(-48*time.Hour))
+	state.S.MarkRequested(string(mirror.RepoArch), "arch:"+repo, repo, repo, now)
+	entry, _ := state.S.Entry(kindGeneric + ":" + member)
+	evictStale(kindGeneric+":"+member, entry)
+
+	assert.FileExists(t, local, "a repository member must survive eviction of its stale generic entry")
+	_, tracked := state.S.Entry(kindGeneric + ":" + member)
+	assert.False(t, tracked, "the stale generic entry is dropped")
 }
